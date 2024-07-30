@@ -1,0 +1,298 @@
+// User adjustable variable to set the desired battery level
+double desiredBatteryLevel = 0.99; // Adjust this value to your desired battery level (e.g., 0.99 for 99%)
+
+// Battery level thresholds
+const float HIGH_BATTERY_LEVEL = 0.8f;  // 80%
+const float LOW_BATTERY_LEVEL = 0.2f;   // 20%
+const float CRITICAL_BATTERY_LEVEL = 0.1f;  // 10%
+
+// Global variables for repeated use
+double currentStoredPower = 0.0;
+double maxStoredPower = 0.0;
+double currentInput = 0.0;
+double currentOutput = 0.0;
+List<IMyBatteryBlock> batteries = new List<IMyBatteryBlock>();
+List<IMyReactor> reactors = new List<IMyReactor>();
+List<IMySolarPanel> solarPanels = new List<IMySolarPanel>();
+List<IMyPowerProducer> windTurbines = new List<IMyPowerProducer>();
+List<IMyPowerProducer> hydrogenEngines = new List<IMyPowerProducer>();
+
+// Thresholds for resource notifications
+double uraniumThreshold = 5.0; // kg
+double hydrogenThreshold = 100.0; // L
+
+// Historical usage tracking
+List<double> uraniumUsageHistory = new List<double>();
+List<double> hydrogenUsageHistory = new List<double>();
+const int historyLimit = 10; // Number of past measurements to consider for averaging
+
+// List of essential and non-essential blocks
+List<IMyFunctionalBlock> essentialBlocks = new List<IMyFunctionalBlock>();
+List<IMyFunctionalBlock> nonEssentialBlocks = new List<IMyFunctionalBlock>();
+
+Program()
+{
+    // Set the script to run every 10 ticks
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+
+    // Initialize essential blocks
+    GridTerminalSystem.GetBlocksOfType(essentialBlocks, block => 
+        block is IMyThrust || 
+        block is IMyGyro || 
+        block is IMyGasTank || 
+        block is IMyGasGenerator || 
+        block is IMyCryoChamber || 
+        block is IMyMedicalRoom || 
+        block is IMyReactor || 
+        block is IMyCockpit);
+
+    // Initialize non-essential blocks
+    GridTerminalSystem.GetBlocksOfType(nonEssentialBlocks, block => 
+        block is IMyAssembler || 
+        block is IMyRefinery || 
+        block is IMyShipDrill || 
+        block is IMyShipWelder || 
+        block is IMyShipGrinder || 
+        block is IMyLightingBlock || 
+        block is IMyProjector || 
+        block is IMyRadioAntenna || 
+        block is IMyLargeTurretBase || 
+        block is IMyShipConnector || 
+        block is IMyMotorStator || 
+        block is IMyMechanicalConnectionBlock || 
+        block is IMyDoor);
+}
+
+void Main(string argument)
+{
+    ResetPowerVariables();
+    GatherBlocks();
+
+    foreach (var battery in batteries)
+    {
+        currentStoredPower += battery.CurrentStoredPower;
+        maxStoredPower += battery.MaxStoredPower;
+        currentInput += battery.CurrentInput;
+        currentOutput += battery.CurrentOutput;
+    }
+
+    currentStoredPower = maxStoredPower * desiredBatteryLevel;
+    double timeUntilFull = currentInput > 0 ? (maxStoredPower - currentStoredPower) / currentInput : double.PositiveInfinity;
+    double timeUntilEmpty = currentOutput > 0 ? currentStoredPower / currentOutput : double.PositiveInfinity;
+    bool isCharging = currentInput > currentOutput;
+
+    ManagePowerUnits();
+    ManageBatteryLevels();
+
+    double totalUranium = reactors.Sum(reactor => GetResourceAmount(reactor, "Uranium"));
+    double totalHydrogen = hydrogenEngines.Sum(engine => GetResourceAmount(engine, "Hydrogen"));
+
+    UpdateResourceUsage(totalUranium, totalHydrogen);
+
+    double avgUraniumUsage = uraniumUsageHistory.Any() ? uraniumUsageHistory.Average() : 0.0;
+    double avgHydrogenUsage = hydrogenUsageHistory.Any() ? hydrogenUsageHistory.Average() : 0.0;
+
+    double estimatedUraniumTimeLeft = avgUraniumUsage > 0 ? totalUranium / avgUraniumUsage : double.PositiveInfinity;
+    double estimatedHydrogenTimeLeft = avgHydrogenUsage > 0 ? totalHydrogen / avgHydrogenUsage : double.PositiveInfinity;
+
+    string notifications = CheckResourceLevels(totalUranium, totalHydrogen);
+    string displayText = CreateDisplayText(isCharging, timeUntilFull, timeUntilEmpty, totalUranium, totalHydrogen, notifications, estimatedUraniumTimeLeft, estimatedHydrogenTimeLeft);
+
+    Echo(displayText);
+    var programmableBlock = Me;
+    programmableBlock.GetSurface(0).WriteText(displayText);
+    
+    var textPanels = new List<IMyTextPanel>();
+    GridTerminalSystem.GetBlocksOfType(textPanels);
+
+    if (textPanels.Count > 0)
+    {
+        var textPanel = textPanels[0];
+        textPanel.WriteText(displayText);
+    }
+}
+
+void ResetPowerVariables()
+{
+    currentStoredPower = 0.0;
+    maxStoredPower = 0.0;
+    currentInput = 0.0;
+    currentOutput = 0.0;
+}
+
+void GatherBlocks()
+{
+    batteries.Clear();
+    reactors.Clear();
+    solarPanels.Clear();
+    windTurbines.Clear();
+    hydrogenEngines.Clear();
+
+    GridTerminalSystem.GetBlocksOfType(batteries);
+    GridTerminalSystem.GetBlocksOfType(reactors);
+    GridTerminalSystem.GetBlocksOfType(solarPanels);
+    GridTerminalSystem.GetBlocksOfType(windTurbines, turbine => turbine.BlockDefinition.TypeIdString.Contains("WindTurbine"));
+    GridTerminalSystem.GetBlocksOfType(hydrogenEngines, engine => engine.BlockDefinition.TypeIdString.Contains("HydrogenEngine"));
+}
+
+void ManagePowerUnits()
+{
+    // Turn off all reactors and hydrogen engines initially
+    foreach (var reactor in reactors)
+    {
+        reactor.Enabled = false;
+    }
+    foreach (var engine in hydrogenEngines)
+    {
+        engine.Enabled = false;
+    }
+
+    // If power is low and output is greater than input, enable reactors and hydrogen engines as needed
+    if (currentStoredPower / maxStoredPower < desiredBatteryLevel && currentOutput > currentInput)
+    {
+        // Enable reactors first
+        foreach (var reactor in reactors)
+        {
+            reactor.Enabled = true;
+            if (currentInput >= currentOutput) break;
+        }
+
+        // Enable hydrogen engines if reactors are not enough
+        foreach (var engine in hydrogenEngines)
+        {
+            engine.Enabled = true;
+            if (currentInput >= currentOutput) break;
+        }
+    }
+}
+
+void ManageBatteryLevels()
+{
+    float batteryLevel = (float)(currentStoredPower / maxStoredPower);
+
+    if (batteryLevel < CRITICAL_BATTERY_LEVEL)
+    {
+        DisableNonEssentialSystems();
+    }
+    else if (batteryLevel < LOW_BATTERY_LEVEL)
+    {
+        SetBatteryChargeMode(Sandbox.ModAPI.Ingame.ChargeMode.Recharge);
+    }
+    else if (batteryLevel > HIGH_BATTERY_LEVEL)
+    {
+        SetBatteryChargeMode(Sandbox.ModAPI.Ingame.ChargeMode.Auto);
+        EnableNonEssentialSystems();  // Re-enable non-essential systems if battery level is above high threshold
+    }
+}
+
+void DisableNonEssentialSystems()
+{
+    foreach (var block in nonEssentialBlocks)
+    {
+        if (block.Enabled)
+        {
+            block.Enabled = false;
+        }
+    }
+}
+
+void EnableNonEssentialSystems()
+{
+    foreach (var block in nonEssentialBlocks)
+    {
+        if (!block.Enabled)
+        {
+            block.Enabled = true;
+        }
+    }
+}
+
+void SetBatteryChargeMode(Sandbox.ModAPI.Ingame.ChargeMode mode)
+{
+    foreach (var battery in batteries)
+    {
+        battery.ChargeMode = mode;
+    }
+}
+
+double GetResourceAmount(IMyTerminalBlock block, string resourceName)
+{
+    if (block.HasInventory)
+    {
+        List<MyInventoryItem> items = new List<MyInventoryItem>();
+        block.GetInventory().GetItems(items, item => item.Type.SubtypeId == resourceName);
+        return items.Sum(item => (double)item.Amount);
+    }
+    return 0.0;
+}
+
+void UpdateResourceUsage(double totalUranium, double totalHydrogen)
+{
+    // Calculate current consumption rates
+    double currentUraniumUsage = reactors.Where(r => r.Enabled).Sum(r => r.CurrentOutput);
+    double currentHydrogenUsage = hydrogenEngines.Where(e => e.Enabled).Sum(e => e.CurrentOutput);
+
+    // Update historical usage data
+    uraniumUsageHistory.Add(currentUraniumUsage);
+    hydrogenUsageHistory.Add(currentHydrogenUsage);
+
+    // Maintain history limit
+    if (uraniumUsageHistory.Count > historyLimit)
+    {
+        uraniumUsageHistory.RemoveAt(0);
+    }
+    if (hydrogenUsageHistory.Count > historyLimit)
+    {
+        hydrogenUsageHistory.RemoveAt(0);
+    }
+}
+
+string CheckResourceLevels(double totalUranium, double totalHydrogen)
+{
+    string notifications = "";
+    if (totalUranium < uraniumThreshold)
+    {
+        notifications += "Warning: Low Uranium levels!\n";
+    }
+    if (totalHydrogen < hydrogenThreshold)
+    {
+        notifications += "Warning: Low Hydrogen levels!\n";
+    }
+    return notifications;
+}
+
+string CreateDisplayText(bool isCharging, double timeUntilFull, double timeUntilEmpty, double totalUranium, double totalHydrogen, string notifications, double estimatedUraniumTimeLeft, double estimatedHydrogenTimeLeft)
+{
+    double batteryPercentage = (currentStoredPower / maxStoredPower) * 100;
+    string displayText = $"Battery Level: {currentStoredPower:F2}/{maxStoredPower:F2} MWh ({batteryPercentage:F0}%)\n";
+    displayText += $"Power In/Out: {currentInput:F2} MW / {currentOutput:F2} MW\n";
+    if (isCharging)
+    {
+        displayText += $"Time Until Full: {FormatTimeShort(timeUntilFull)}\n";
+    }
+    else
+    {
+        displayText += $"Time Until Empty: {FormatTimeShort(timeUntilEmpty)}\n";
+    }
+
+    displayText += notifications;
+    displayText += "Power Units Status:\n";
+    displayText += $"Reactors: {reactors.Count}, Active: {reactors.Count(r => r.Enabled)}\n";
+    displayText += $"Solar Panels: {solarPanels.Count}\n";
+    displayText += $"Wind Turbines: {windTurbines.Count}\n";
+    displayText += $"Hydrogen Engines: {hydrogenEngines.Count}, Active: {hydrogenEngines.Count(e => e.Enabled)}\n";
+
+    displayText += $"Uranium: {totalUranium:F2} kg, Est. Depletion: {FormatTimeShort(estimatedUraniumTimeLeft)}\n";
+    displayText += $"Hydrogen: {totalHydrogen:F2} L, Est. Depletion: {FormatTimeShort(estimatedHydrogenTimeLeft)}\n";
+
+    return displayText;
+}
+
+string FormatTimeShort(double time)
+{
+    if (double.IsInfinity(time))
+        return "Infinity";
+
+    TimeSpan timeSpan = TimeSpan.FromHours(time);
+    return string.Format("{0:D2}h {0:D2}m", timeSpan.Hours, timeSpan.Minutes);
+}
